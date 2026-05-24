@@ -1,0 +1,194 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker Compose — Stack Infrahub (SSOT)
+#
+# Services :
+#   database      → Neo4j 5 (graph database)
+#   message-queue → RabbitMQ 3.12 (broker de messages)
+#   cache         → Redis 7 (cache)
+#   infrahub      → Application principale (API + UI) sur :8000
+#
+# Usage :
+#   docker compose up -d
+#   docker compose logs -f infrahub   # attendre "Application startup complete"
+#   docker compose down -v            # cleanup complet
+#
+# Default admin token: satoken  (defined in .env → INFRAHUB_INITIAL_ADMIN_TOKEN)
+# Interface web : http://localhost:8000  (admin / infrahub)
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-infrahub-config: &infrahub_config
+  INFRAHUB_DB_DRIVER: neo4j
+  INFRAHUB_DB_USERNAME: neo4j
+  INFRAHUB_DB_PASSWORD: ${NEO4J_PASSWORD:-infrahub}
+  INFRAHUB_DB_ADDRESS: database
+  INFRAHUB_DB_PORT: "7687"
+  INFRAHUB_DB_TYPE: neo4j
+  INFRAHUB_BROKER_DRIVER: rabbitmq
+  INFRAHUB_BROKER_USERNAME: infrahub
+  INFRAHUB_BROKER_PASSWORD: ${RABBITMQ_PASSWORD:-infrahub}
+  INFRAHUB_BROKER_ADDRESS: message-queue
+  INFRAHUB_BROKER_PORT: "5672"
+  INFRAHUB_BROKER_VIRTUALHOST: "/"
+  INFRAHUB_CACHE_DRIVER: redis
+  INFRAHUB_CACHE_ADDRESS: cache
+  INFRAHUB_CACHE_PORT: "6379"
+  INFRAHUB_INITIAL_ADMIN_TOKEN: ${INFRAHUB_TOKEN:-satoken}
+  INFRAHUB_INITIAL_ADMIN_PASSWORD: ${INFRAHUB_ADMIN_PASSWORD:-infrahub}
+  INFRAHUB_SECRET_KEY: ${INFRAHUB_SECRET_KEY:-netalps-demo-secret-key-changeme}
+  INFRAHUB_ALLOW_ANONYMOUS_ACCESS: "false"
+  INFRAHUB_ANALYTICS_ENABLE: "false"
+  INFRAHUB_LOG_LEVEL: WARNING
+  INFRAHUB_WORKFLOW_ADDRESS: task-manager
+  INFRAHUB_WORKFLOW_PORT: "4200"
+  PREFECT_API_URL: http://task-manager:4200/api
+
+services:
+
+  # ─── Neo4j Database ─────────────────────────────────────────────────────────
+  database:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-infrahub}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_dbms_memory_heap_initial__size: 512m
+      NEO4J_dbms_memory_heap_max__size: 1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ─── Message broker RabbitMQ ───────────────────────────────────────────────
+  message-queue:
+    image: rabbitmq:3.12-management
+    environment:
+      RABBITMQ_DEFAULT_USER: infrahub
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-infrahub}
+      RABBITMQ_DEFAULT_VHOST: "/"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ─── Cache Redis ───────────────────────────────────────────────────────────
+  cache:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ─── Infrahub Server ───────────────────────────────────────────────────────
+  infrahub:
+    image: opsmill/infrahub:${INFRAHUB_VERSION:-1.1.1}
+    command: infrahub server start --listen 0.0.0.0 --port 8000
+    environment:
+      <<: *infrahub_config
+    ports:
+      - "${INFRAHUB_PORT:-8000}:8000"
+    volumes:
+      - infrahub_storage:/opt/infrahub/storage
+    depends_on:
+      database:
+        condition: service_healthy
+      message-queue:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      task-manager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-4", "-sf", "http://127.0.0.1:8000/api/schema/summary"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  # ─── Prefect DB (backend for task-manager) ────────────────────────────────
+  task-manager-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: prefect
+    volumes:
+      - workflow_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ─── Prefect Server (task-manager) ────────────────────────────────────────
+  task-manager:
+    image: prefecthq/prefect:3.0.11-python3.12
+    command: prefect server start --host 0.0.0.0 --ui
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://postgres:postgres@task-manager-db:5432/prefect
+      PREFECT_LOCAL_STORAGE_PATH: /opt/prefect/
+    ports:
+      - "4200:4200"
+    depends_on:
+      task-manager-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/httpx", "http://localhost:4200/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  # ─── Prefect Worker (infrahubasync) ───────────────────────────────────────
+  task-worker:
+    image: opsmill/infrahub:${INFRAHUB_VERSION:-1.1.1}
+    command: prefect worker start --type infrahubasync --pool infrahub-worker --with-healthcheck
+    environment:
+      <<: *infrahub_config
+      INFRAHUB_ADDRESS: http://infrahub:8000
+      INFRAHUB_INTERNAL_ADDRESS: http://infrahub:8000
+      INFRAHUB_API_TOKEN: ${INFRAHUB_TOKEN:-satoken}
+    volumes:
+      - infrahub_storage:/opt/infrahub/storage
+    depends_on:
+      infrahub:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── Infrahub Git Agent ────────────────────────────────────────────────────
+  infrahub-git-agent:
+    image: opsmill/infrahub:${INFRAHUB_VERSION:-1.1.1}
+    command: infrahub git-agent start --debug
+    environment:
+      <<: *infrahub_config
+      INFRAHUB_ADDRESS: http://infrahub:8000
+    volumes:
+      - infrahub_storage:/opt/infrahub/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      infrahub:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  rabbitmq_data:
+  redis_data:
+  infrahub_storage:
+  workflow_db:

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# PyATS logs
+logs/
+*.log
+
+# Infrahub env (do not commit secrets in prod)
+# infrahub/.env  ← uncomment to ignore the .env
+
+# Temporary data
+*.tmp
+*.bak
+
+# Containerlab runtime artifacts
+clab-frr-infrahub-demo/
+*.clab.bak
+
+# Virtual environment
+.venv/
+
+# Infrahub Docker volumes / data
+infrahub/data/
+
+# Infrahub env file (contains secrets — use .env.example as template)
+infrahub/.env

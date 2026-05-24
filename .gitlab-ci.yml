@@ -1,0 +1,240 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# GitLab CI/CD Pipeline — NetAlps Infrahub Demo
+# Containerlab + FRR (4 routeurs) + Infrahub SSOT + PyATS
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Architecture du pipeline :
+#
+#   [infrahub_start] ──► [load_schema] ──► [load_data] ──► [generate_configs]
+#                                                                    │
+#                                                               [deploy_lab]
+#                                                                    │
+#                                                   ┌───────────────┤
+#                                               [pre_check]   [post_check]
+#                                                                    │
+#                                                              [cleanup_lab]
+#                                                           (always + infrahub down)
+#
+# Runner requis :
+#   - Type : shell executor (Docker + Containerlab access)
+#   - Tag  : frr-infrahub  (to configure on the self-hosted runner)
+#   - Venv : .venv/bin/activate
+#
+# CI variables to define in GitLab (Settings → CI/CD → Variables):
+#   INFRAHUB_TOKEN   : Infrahub API token (default: satoken for demo)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+stages:
+  - infrahub
+  - configure
+  - deploy
+  - pre_check
+  - post_check
+  - cleanup
+
+# ─── Variables globales ───────────────────────────────────────────────────────
+variables:
+  VENV_ACTIVATE:       .venv/bin/activate
+  DEMO_DIR:            "$CI_PROJECT_DIR/netalps_infrahub"
+  TOPO:                "$CI_PROJECT_DIR/netalps_infrahub/topology.clab.yml"
+  TESTBED:             "$CI_PROJECT_DIR/netalps_infrahub/tests/testbed.yml"
+  INFRAHUB_COMPOSE:    "$CI_PROJECT_DIR/netalps_infrahub/infrahub"
+  INFRAHUB_ADDRESS:    "http://localhost:8000"
+  INFRAHUB_TOKEN:      "satoken"
+
+# ─── Workflow ─────────────────────────────────────────────────────────────────
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\//'
+    - if: '$CI_COMMIT_BRANCH =~ /^infrahub\//'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE : infrahub — Start the SSOT stack
+# ─────────────────────────────────────────────────────────────────────────────
+
+infrahub_start:
+  stage: infrahub
+  tags:
+    - frr-infrahub
+  script:
+    - echo "=== Starting Infrahub stack ==="
+    - cd "$INFRAHUB_COMPOSE"
+    - docker compose --env-file .env up -d
+    - echo "=== Attente Infrahub (max 5 min) ==="
+    - bash "$DEMO_DIR/scripts/wait_for_infrahub.sh" "$INFRAHUB_ADDRESS" 30 10
+
+load_schema:
+  stage: infrahub
+  tags:
+    - frr-infrahub
+  needs:
+    - infrahub_start
+  script:
+    - source "$VENV_ACTIVATE"
+    - echo "=== Loading Infrahub schema ==="
+    - |
+      INFRAHUB_ADDRESS="$INFRAHUB_ADDRESS" \
+      INFRAHUB_API_TOKEN="$INFRAHUB_TOKEN" \
+      infrahubctl schema load "$DEMO_DIR/infrahub/schema/network.yml" --branch main
+    - echo "=== Schema loaded ==="
+
+load_data:
+  stage: infrahub
+  tags:
+    - frr-infrahub
+  needs:
+    - load_schema
+  script:
+    - source "$VENV_ACTIVATE"
+    - cd "$DEMO_DIR"
+    - echo "=== Loading network data into Infrahub ==="
+    - |
+      INFRAHUB_ADDRESS="$INFRAHUB_ADDRESS" \
+      INFRAHUB_TOKEN="$INFRAHUB_TOKEN" \
+      python infrahub/load_data.py
+    - echo "=== Data loaded ==="
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE : configure — Generate FRR configs from Infrahub
+# ─────────────────────────────────────────────────────────────────────────────
+
+generate_configs:
+  stage: configure
+  tags:
+    - frr-infrahub
+  needs:
+    - load_data
+  script:
+    - source "$VENV_ACTIVATE"
+    - cd "$DEMO_DIR"
+    - echo "=== Generating FRR configs from Infrahub SSOT ==="
+    - |
+      INFRAHUB_ADDRESS="$INFRAHUB_ADDRESS" \
+      INFRAHUB_TOKEN="$INFRAHUB_TOKEN" \
+      python scripts/generate_configs.py
+    - echo "=== Configs generated ==="
+    - echo "--- Diff configs (vs git HEAD) ---"
+    - git diff --stat configs/ || true
+  artifacts:
+    name: "frr-configs-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - "$DEMO_DIR/configs/"
+    expire_in: 1 hour
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE : deploy — Deploy the Containerlab lab
+# ─────────────────────────────────────────────────────────────────────────────
+
+deploy_lab:
+  stage: deploy
+  tags:
+    - frr-infrahub
+  needs:
+    - generate_configs
+  script:
+    - echo "=== Deploy : Containerlab frr-infrahub-demo ==="
+    - containerlab deploy -t "$TOPO" --reconfigure
+    - echo "=== Attente 30 s convergence OSPF ==="
+    - sleep 30
+    - echo "=== Containers running ==="
+    - docker ps --filter "name=clab-frr-infrahub-demo" \
+        --format "table {{.Names}}\t{{.Status}}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE : pre_check
+# ─────────────────────────────────────────────────────────────────────────────
+
+pre_check:
+  stage: pre_check
+  tags:
+    - frr-infrahub
+  needs:
+    - deploy_lab
+  script:
+    - source "$VENV_ACTIVATE"
+    - cd "$DEMO_DIR"
+    - echo "=== Pre-check : infra + containers + daemons + Infrahub SSOT ==="
+    - |
+      INFRAHUB_ADDRESS="$INFRAHUB_ADDRESS" \
+      INFRAHUB_TOKEN="$INFRAHUB_TOKEN" \
+      python tests/pre_check.py --testbed "$TESTBED"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE : post_check
+# ─────────────────────────────────────────────────────────────────────────────
+
+post_check:
+  stage: post_check
+  tags:
+    - frr-infrahub
+  needs:
+    - pre_check
+  script:
+    - source "$VENV_ACTIVATE"
+    - cd "$DEMO_DIR"
+    - echo "=== Post-check : OSPF Full + routes + BFD + ping E2E + audit SSOT ==="
+    - |
+      INFRAHUB_ADDRESS="$INFRAHUB_ADDRESS" \
+      INFRAHUB_TOKEN="$INFRAHUB_TOKEN" \
+      python tests/post_check.py --testbed "$TESTBED"
+  artifacts:
+    name: "pyats-results-$CI_COMMIT_SHORT_SHA"
+    when: always
+    paths:
+      - "$DEMO_DIR/logs/"
+    expire_in: 7 days
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL JOB : failure demo (manual)
+# ─────────────────────────────────────────────────────────────────────────────
+# SSOT-driven scenario:
+#   1) change ospf_area in Infrahub
+#   2) regenerate FRR configs
+#   3) reload FRR
+#   4) post_check expected FAIL
+#   5) restore SSOT and validate PASS
+# ─────────────────────────────────────────────────────────────────────────────
+failure_demo:
+  stage: post_check
+  tags:
+    - frr-infrahub
+  when: manual
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - source "$VENV_ACTIVATE"
+    - cd "$DEMO_DIR"
+    - echo "=== Failure Demo : SSOT-driven OSPF failure ==="
+    - |
+      INFRAHUB_ADDRESS="$INFRAHUB_ADDRESS" \
+      INFRAHUB_TOKEN="$INFRAHUB_TOKEN" \
+      DEMO_DIR="$DEMO_DIR" \
+      TOPO="$TOPO" \
+      TESTBED="$TESTBED" \
+      bash scripts/failure_demo.sh
+  artifacts:
+    name: "failure-demo-$CI_COMMIT_SHORT_SHA"
+    when: always
+    paths:
+      - "$DEMO_DIR/logs/"
+    expire_in: 3 days
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE : cleanup — Lab destruction + Infrahub shutdown (always)
+# ─────────────────────────────────────────────────────────────────────────────
+
+cleanup_lab:
+  stage: cleanup
+  tags:
+    - frr-infrahub
+  when: always
+  script:
+    - echo "=== Cleanup : destruction du lab clab ==="
+    - containerlab destroy -t "$TOPO" --cleanup || true
+    - echo "=== Stopping Infrahub stack ==="
+    - cd "$INFRAHUB_COMPOSE" && docker compose down -v || true
+    - echo "=== Cleanup complete ==="

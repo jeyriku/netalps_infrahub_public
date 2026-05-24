@@ -1,0 +1,158 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PyATS Testbed — frr-infrahub-demo
+#
+# 4 FRR routers in chain + 2 Linux hosts
+# Topologie :
+#   host-left ─ rtr-01 ─ rtr-02 ─ rtr-03 ─ rtr-04 ─ host-right
+#
+# Les devices se connectent via `docker exec` (subprocess, pas SSH).
+# Les noms de containers suivent le naming Containerlab :
+#   clab-{lab-name}-{node-name}
+#
+# Usage standalone :
+#   python tests/pre_check.py  --testbed tests/testbed.yml
+#   python tests/post_check.py --testbed tests/testbed.yml
+#
+# Usage job PyATS :
+#   pyats run job tests/test_job.py --testbed-file tests/testbed.yml
+# ─────────────────────────────────────────────────────────────────────────────
+
+testbed:
+  name: frr-infrahub-demo
+
+devices:
+
+  # ─── Routeurs FRR ───────────────────────────────────────────────────────────
+  frr-rtr-01:
+    alias: rtr01
+    os: linux
+    type: router
+    connections:
+      mgmt:
+        protocol: ssh
+        ip: 172.20.36.11
+    credentials:
+      default:
+        username: root
+        password: ""
+    custom:
+      container:    clab-frr-infrahub-demo-frr-rtr-01
+      mgmt_ip:      172.20.36.11
+      loopback:     10.0.0.1
+      # Interfaces P2P
+      wan_eth1_ip:     10.0.12.1
+      wan_eth1_peer:   10.0.12.2
+      # LAN
+      lan:          192.168.10.0/24
+      lan_gw:       192.168.10.1
+      # OSPF neighbors attendus (loopback des voisins directs)
+      ospf_peers:
+        - 10.0.0.2
+
+  frr-rtr-02:
+    alias: rtr02
+    os: linux
+    type: router
+    connections:
+      mgmt:
+        protocol: ssh
+        ip: 172.20.36.12
+    credentials:
+      default:
+        username: root
+        password: ""
+    custom:
+      container:    clab-frr-infrahub-demo-frr-rtr-02
+      mgmt_ip:      172.20.36.12
+      loopback:     10.0.0.2
+      wan_eth1_ip:  10.0.12.2
+      wan_eth1_peer: 10.0.12.1
+      wan_eth2_ip:  10.0.23.1
+      wan_eth2_peer: 10.0.23.2
+      ospf_peers:
+        - 10.0.0.1
+        - 10.0.0.3
+
+  frr-rtr-03:
+    alias: rtr03
+    os: linux
+    type: router
+    connections:
+      mgmt:
+        protocol: ssh
+        ip: 172.20.36.13
+    credentials:
+      default:
+        username: root
+        password: ""
+    custom:
+      container:    clab-frr-infrahub-demo-frr-rtr-03
+      mgmt_ip:      172.20.36.13
+      loopback:     10.0.0.3
+      wan_eth1_ip:  10.0.23.2
+      wan_eth1_peer: 10.0.23.1
+      wan_eth2_ip:  10.0.34.1
+      wan_eth2_peer: 10.0.34.2
+      ospf_peers:
+        - 10.0.0.2
+        - 10.0.0.4
+
+  frr-rtr-04:
+    alias: rtr04
+    os: linux
+    type: router
+    connections:
+      mgmt:
+        protocol: ssh
+        ip: 172.20.36.14
+    credentials:
+      default:
+        username: root
+        password: ""
+    custom:
+      container:    clab-frr-infrahub-demo-frr-rtr-04
+      mgmt_ip:      172.20.36.14
+      loopback:     10.0.0.4
+      wan_eth1_ip:  10.0.34.2
+      wan_eth1_peer: 10.0.34.1
+      lan:          192.168.40.0/24
+      lan_gw:       192.168.40.1
+      ospf_peers:
+        - 10.0.0.3
+
+  # ─── Linux Hosts ────────────────────────────────────────────────────────────
+  host-left:
+    alias: hleft
+    os: linux
+    type: host
+    connections:
+      mgmt:
+        protocol: ssh
+        ip: 172.20.36.21
+    credentials:
+      default:
+        username: root
+        password: ""
+    custom:
+      container: clab-frr-infrahub-demo-host-left
+      ip:        192.168.10.10
+      gateway:   192.168.10.1
+      target_ip: 192.168.40.10
+
+  host-right:
+    alias: hright
+    os: linux
+    type: host
+    connections:
+      mgmt:
+        protocol: ssh
+        ip: 172.20.36.22
+    credentials:
+      default:
+        username: root
+        password: ""
+    custom:
+      container: clab-frr-infrahub-demo-host-right
+      ip:        192.168.40.10
+      gateway:   192.168.40.1
+      target_ip: 192.168.10.10
