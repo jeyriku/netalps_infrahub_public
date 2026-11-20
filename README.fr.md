@@ -23,6 +23,7 @@
 12. [Interface web Infrahub](#12-interface-web-infrahub)
 13. [Dépannage](#13-dépannage)
 14. [Pour aller plus loin](#14-pour-aller-plus-loin)
+15. [Fabric EVPN leaf-spine](#15-fabric-evpn-leaf-spine)
 
 ---
 
@@ -316,7 +317,7 @@ Aucune expérience préalable de pyATS, Infrahub ou Containerlab n'est requise �
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install pyats infrahub-sdk httpx pyyaml
+pip install -r requirements.txt
 ```
 
 ### Images Docker
@@ -852,6 +853,59 @@ Au lieu du `generate_configs.py` Python personnalisé, utilisez les [Infrahub Tr
 ### Étendre à d'autres fournisseurs
 
 Remplacez ou ajoutez des nœuds Nokia SR Linux (supportés par Containerlab nativement). Ajoutez un champ `vendor` à `NetalpsNetworkDevice` et faites dispatcher `generate_configs.py` vers des générateurs spécifiques à chaque fournisseur.
+
+---
+
+## 15. Fabric EVPN leaf-spine
+
+Un second lab indépendant (`fabric.clab.yml`) modélise une fabric de datacenter : 2 spines, 4 leaves, un hôte par leaf. Il tourne à côté de la chaîne OSPF et partage la même instance Infrahub, avec son propre schéma (`infrahub/schema/fabric.yml`).
+
+```
+        spine-01 (AS 65000)          spine-02 (AS 65000)
+              │ │ │ │                      │ │ │ │
+   leaf-01      leaf-02      leaf-03      leaf-04
+   AS 65101     AS 65102     AS 65103     AS 65104
+      │            │            │            │
+   host-01      host-02      host-03      host-04
+   VLAN 10      VLAN 20      VLAN 10      VLAN 20
+```
+
+| Élément | Valeur |
+|---|---|
+| Underlay | eBGP unnumbered (IPv6 link-local) sur chaque lien leaf-spine |
+| Loopbacks / VTEPs | spines `10.1.0.1-2/32`, leaves `10.1.1.1-4/32` |
+| VRF `tenant1` | L3VNI `50001` (IRB symétrique) |
+| VLAN 10 | L2VNI `10010`, `192.168.110.0/24`, hôtes `.11` / `.13` |
+| VLAN 20 | L2VNI `10020`, `192.168.120.0/24`, hôtes `.12` / `.14` |
+| Passerelle | anycast `.1` sur chaque leaf |
+
+Infrahub contient les équipements, les ASN, les loopbacks, les interfaces de fabric et les VRF. La plomberie VLAN/VXLAN est dans `configs-fabric/leaf-init.sh`, lancé par le `exec:` de chaque leaf, de la même façon que le lab en chaîne configure les IP des interfaces hors de FRR.
+
+### Lancement
+
+L'hôte Docker a besoin des modules noyau `vrf` et `vxlan` :
+
+```bash
+sudo modprobe vrf vxlan
+
+INFRAHUB_API_TOKEN=satoken infrahubctl schema load infrahub/schema/fabric.yml --branch main
+INFRAHUB_TOKEN=satoken python infrahub/load_fabric_data.py
+INFRAHUB_TOKEN=satoken python scripts/generate_fabric_configs.py
+
+containerlab deploy -t fabric.clab.yml
+python tests/fabric_check.py
+
+containerlab destroy -t fabric.clab.yml --cleanup
+```
+
+### Ce que valide `fabric_check.py`
+
+| Test | Vérifie |
+|---|---|
+| TestUnderlay | Les spines ont 4 pairs eBGP Established, les leaves 2 ; chaque leaf atteint la loopback de chaque autre leaf par 2 chemins ECMP |
+| TestOverlay | Chaque leaf a son L2VNI et le L3VNI `50001` |
+| TestConnectivity | host-01 ↔ host-03 et host-02 ↔ host-04 (L2 sur VXLAN), host-01 ↔ host-04 (routé via le L3VNI) |
+| TestSSoTAudit | L'ASN BGP en cours d'exécution de chaque nœud correspond à Infrahub |
 
 ---
 

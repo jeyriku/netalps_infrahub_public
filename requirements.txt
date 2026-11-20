@@ -1,0 +1,4 @@
+pyats
+infrahub-sdk[ctl]>=1.16
+httpx
+pyyaml

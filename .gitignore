@@ -17,6 +17,7 @@ logs/
 
 # Containerlab runtime artifacts
 clab-frr-infrahub-demo/
+clab-dc-fabric/
 *.clab.bak
 
 # Virtual environment
